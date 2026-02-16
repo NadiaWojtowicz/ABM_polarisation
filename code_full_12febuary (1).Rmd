@@ -1,0 +1,951 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-02-12"
+---
+```{r}
+install.packages("tidyverse")
+install.packages("lme4")
+install.packages("lmerTest")
+install.packages("emmeans")
+install.packages("effectsize")
+install.packages("ggplot2")
+install.packages("patchwork")
+install.packages("car")
+```
+
+
+```{r}
+# ==============================================================================
+# COMPREHENSIVE ANALYSIS: OPINION DYNAMICS & POLARIZATION
+# CORRECTED VERSION - Aligned with Research Hypotheses
+# 4 Conditions: Null, Tie-cutting, Repulsion+Tiecut, Repulsion
+# ==============================================================================
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(effectsize)
+library(ggplot2)
+library(patchwork)
+library(car)
+
+# ============================ CONFIGURATION ============================
+
+OUTPUT_DIR <- "/work/files/simulation/results"
+ANALYSIS_DIR <- "/work/files/simulation/analysis_final"
+FIGURES_DIR <- file.path(ANALYSIS_DIR, "figures")
+
+dir.create(ANALYSIS_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+TERMINAL_TICKS <- seq(8000, 9000, by = 50)
+theme_set(theme_minimal(base_size = 12))
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ============================ LOAD DATA ============================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("LOADING SIMULATION DATA\n")
+cat(rep("=", 80), "\n\n")
+
+history_files <- list.files(OUTPUT_DIR, 
+                            pattern = "history\\.csv$", 
+                            recursive = TRUE, 
+                            full.names = TRUE)
+
+cat(sprintf("Found %d history files\n", length(history_files)))
+
+df_full <- map_dfr(history_files, function(file) {
+  
+  parts <- strsplit(file, "/")[[1]]
+  run_folder <- parts[length(parts) - 1]
+  condition_folder <- parts[length(parts) - 2]
+  
+  seed <- as.integer(sub("run_", "", run_folder))
+  
+  # Parse 4 conditions
+  if (grepl("^null_", condition_folder)) {
+    condition <- "null"
+    remainder <- sub("^null_", "", condition_folder)
+  } else if (grepl("^repulsion_tiecut_", condition_folder)) {
+    condition <- "repulsiontiecut"
+    remainder <- sub("^repulsion_tiecut_", "", condition_folder)
+  } else if (grepl("^repulsion_", condition_folder)) {
+    condition <- "repulsion"
+    remainder <- sub("^repulsion_", "", condition_folder)
+  } else if (grepl("^tiecut_", condition_folder)) {
+    condition <- "tiecut"
+    remainder <- sub("^tiecut_", "", condition_folder)
+  } else {
+    return(NULL)
+  }
+  
+  matches <- str_match(remainder, "^(er|smallworld|ba)_eps([0-9.]+)$")
+  network <- matches[2]
+  epsilon <- as.numeric(matches[3])
+  
+  read_csv(file, show_col_types = FALSE) %>%
+    mutate(
+      condition = condition,
+      network = network,
+      epsilon = epsilon,
+      seed = seed
+    )
+}, .progress = TRUE)
+
+cat(sprintf("\nLoaded %d total observations\n", nrow(df_full)))
+cat(sprintf("Unique runs: %d\n", n_distinct(df_full$condition, df_full$network, 
+                                             df_full$epsilon, df_full$seed)))
+
+# ============================ DATA PREPARATION ============================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("DATA PREPARATION\n")
+cat(rep("=", 80), "\n\n")
+
+df_terminal <- df_full %>%
+  filter(tick %in% TERMINAL_TICKS) %>%
+  group_by(condition, network, epsilon, seed) %>%
+  summarise(
+    global_distance = mean(global_distance, na.rm = TRUE),
+    polarization_ratio = mean(polarization_ratio, na.rm = TRUE),
+    within_bloc_dist = mean(within_bloc_dist, na.rm = TRUE),
+    between_bloc_dist = mean(between_bloc_dist, na.rm = TRUE),
+    edges = mean(edges, na.rm = TRUE),
+    components = mean(components, na.rm = TRUE),
+    density = mean(density, na.rm = TRUE),
+    modularity = mean(modularity, na.rm = TRUE),
+    local_agreement = mean(local_agreement, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_terminal <- df_terminal %>%
+  mutate(
+    condition = factor(condition, 
+                      levels = c("null", "tiecut", "repulsiontiecut", "repulsion"),
+                      labels = c("Null", "Tie-cutting", "Repulsion+Tiecut", "Repulsion")),
+    network = factor(network, 
+                    levels = c("er", "smallworld", "ba"),
+                    labels = c("ER", "Small-world", "BA")),
+    epsilon = as.numeric(epsilon),
+    seed = factor(seed)
+  )
+
+cat("Terminal values extracted (ticks 8000-9000)\n")
+cat(sprintf("Conditions: %s\n", paste(levels(df_terminal$condition), collapse = ", ")))
+cat(sprintf("Networks: %s\n", paste(levels(df_terminal$network), collapse = ", ")))
+cat(sprintf("Epsilon values: %.2f, %.2f\n", min(df_terminal$epsilon), max(df_terminal$epsilon)))
+cat(sprintf("Seeds: %d unique\n\n", nlevels(df_terminal$seed)))
+
+sample_sizes <- df_terminal %>%
+  count(network, condition, epsilon) %>%
+  pivot_wider(names_from = epsilon, values_from = n, names_prefix = "eps_", values_fill = 0)
+
+cat("Sample sizes by condition:\n")
+print(sample_sizes)
+cat("\n")
+
+# ============================ PRIMARY DATASET ============================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("PRIMARY ANALYSIS: SMALL-WORLD NETWORK\n")
+cat(rep("=", 80), "\n\n")
+
+cat("Rationale:\n")
+cat("  - Small-world networks approximate real social structures\n")
+cat("  - High clustering + short path lengths\n")
+cat("  - Validated for political discussion networks\n\n")
+
+df_primary <- df_terminal %>%
+  filter(network == "Small-world") %>%
+  droplevels()
+
+cat(sprintf("Primary dataset: %d observations\n", nrow(df_primary)))
+cat(sprintf("  - Conditions: %d\n", nlevels(df_primary$condition)))
+cat(sprintf("  - Seeds: %d\n", nlevels(df_primary$seed)))
+cat(sprintf("  - Epsilon levels: %d\n\n", length(unique(df_primary$epsilon))))
+
+# ==============================================================================
+# RQ1 / H1: GLOBAL OPINION DISPERSION
+# ==============================================================================
+
+cat(rep("-", 80), "\n", sep = "")
+cat("RQ1: Do disagreement response mechanisms differentially affect \n")
+cat("     global opinion dispersion?\n")
+cat(rep("-", 80), "\n\n")
+
+cat("HYPOTHESES:\n")
+cat("  H1a: Pure repulsion produces HIGHEST global dispersion\n")
+cat("       (Repulsion > Null & Tie-cutting)\n")
+cat("  H1b: Pure tie-cutting produces dispersion EQUIVALENT to null\n")
+cat("       (Tie-cutting ≈ Null)\n")
+cat("  H1c: Combined condition produces INTERMEDIATE dispersion\n")
+cat("       (Null < Repulsion+Tiecut < Repulsion)\n\n")
+
+h1_model <- lmer(global_distance ~ condition + (1|seed), data = df_primary)
+
+cat("--- MODEL SUMMARY ---\n")
+print(summary(h1_model))
+cat("\n")
+
+h1_anova <- anova(h1_model)
+cat("--- ANOVA (Type III) ---\n")
+print(h1_anova)
+cat("\n")
+
+h1_eta <- eta_squared(h1_anova, partial = TRUE)
+cat("--- EFFECT SIZE (Partial η²) ---\n")
+print(h1_eta)
+cat("\n")
+
+h1_emm <- emmeans(h1_model, ~ condition)
+cat("--- ESTIMATED MARGINAL MEANS ---\n")
+print(h1_emm)
+cat("\n")
+
+h1_pairs <- pairs(h1_emm, adjust = "bonferroni")
+cat("--- PAIRWISE CONTRASTS (Bonferroni) ---\n")
+print(h1_pairs)
+cat("\n")
+
+h1_cohens <- eff_size(h1_emm, sigma = sigma(h1_model), edf = df.residual(h1_model))
+cat("--- COHEN'S d ---\n")
+print(h1_cohens)
+cat("\n")
+
+# Hypothesis tests
+h1_df <- as.data.frame(h1_emm)
+null_gd <- h1_df$emmean[h1_df$condition == "Null"]
+tiecut_gd <- h1_df$emmean[h1_df$condition == "Tie-cutting"]
+reptie_gd <- h1_df$emmean[h1_df$condition == "Repulsion+Tiecut"]
+rep_gd <- h1_df$emmean[h1_df$condition == "Repulsion"]
+
+cat("--- HYPOTHESIS EVALUATION ---\n")
+
+# H1a: Repulsion > Null AND Repulsion > Tie-cutting
+h1a_test <- rep_gd > null_gd && rep_gd > tiecut_gd
+cat(sprintf("H1a (Repulsion > Null & Tie-cutting): %.3f > %.3f & %.3f\n",
+            rep_gd, null_gd, tiecut_gd))
+cat(sprintf("     Result: %s\n\n", ifelse(h1a_test, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H1b: Tie-cutting ≈ Null (difference < 2% of scale)
+h1b_diff <- abs(tiecut_gd - null_gd)
+h1b_test <- h1b_diff < 0.02
+cat(sprintf("H1b (Tie-cutting ≈ Null): |%.3f - %.3f| = %.4f\n",
+            tiecut_gd, null_gd, h1b_diff))
+cat(sprintf("     Result: %s\n\n", ifelse(h1b_test, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H1c: Null < Repulsion+Tiecut < Repulsion
+h1c_test <- null_gd < reptie_gd && reptie_gd < rep_gd
+cat(sprintf("H1c (Null < Rep+Tiecut < Repulsion): %.3f < %.3f < %.3f\n",
+            null_gd, reptie_gd, rep_gd))
+cat(sprintf("     Result: %s\n\n", ifelse(h1c_test, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+write_csv(as.data.frame(h1_anova), file.path(ANALYSIS_DIR, "h1_anova.csv"))
+write_csv(as.data.frame(h1_emm), file.path(ANALYSIS_DIR, "h1_emmeans.csv"))
+write_csv(as.data.frame(h1_pairs), file.path(ANALYSIS_DIR, "h1_contrasts.csv"))
+write_csv(as.data.frame(h1_cohens), file.path(ANALYSIS_DIR, "h1_cohens_d.csv"))
+
+# ==============================================================================
+# RQ2 / H2: TOLERANCE MODERATION
+# ==============================================================================
+
+cat("\n")
+cat(rep("-", 80), "\n", sep = "")
+cat("RQ2: Does tolerance for disagreement moderate the effects of \n")
+cat("     disagreement response mechanisms?\n")
+cat(rep("-", 80), "\n\n")
+
+cat("HYPOTHESES:\n")
+cat("  H2a: Lower tolerance amplifies pure repulsion's polarizing effect\n")
+cat("       (ε=0.40 > ε=0.50 for Repulsion)\n")
+cat("  H2b: Lower tolerance amplifies tie-cutting's fragmentation\n")
+cat("       (without affecting opinion dispersion)\n")
+cat("  H2c: Lower tolerance amplifies combined condition's effect\n")
+cat("       (ε=0.40 > ε=0.50 for Repulsion+Tiecut)\n")
+cat("  H2d: Significant Condition × Epsilon interaction\n")
+cat("       (stronger moderation for repulsion-containing conditions)\n\n")
+
+h2_model <- lmer(global_distance ~ condition * epsilon + (1|seed), data = df_primary)
+
+cat("--- MODEL SUMMARY ---\n")
+print(summary(h2_model))
+cat("\n")
+
+h2_anova <- anova(h2_model)
+cat("--- ANOVA (Type III) ---\n")
+print(h2_anova)
+cat("\n")
+
+h2_eta <- eta_squared(h2_anova, partial = TRUE)
+cat("--- EFFECT SIZE ---\n")
+print(h2_eta)
+cat("\n")
+
+h2_emm <- emmeans(h2_model, ~ condition | epsilon)
+cat("--- ESTIMATED MARGINAL MEANS (by Epsilon) ---\n")
+print(h2_emm)
+cat("\n")
+
+h2_eps_contrasts <- emmeans(h2_model, pairwise ~ epsilon | condition)
+cat("--- EPSILON EFFECTS WITHIN CONDITIONS ---\n")
+print(h2_eps_contrasts$contrasts)
+cat("\n")
+
+h2_df <- as.data.frame(h2_emm)
+
+cat("--- HYPOTHESIS EVALUATION ---\n\n")
+
+# H2a: Repulsion shows epsilon effect
+rep_040 <- h2_df %>% filter(condition == "Repulsion", epsilon == 0.40) %>% pull(emmean)
+rep_050 <- h2_df %>% filter(condition == "Repulsion", epsilon == 0.50) %>% pull(emmean)
+h2a_delta <- rep_040 - rep_050
+h2a_pval <- h2_eps_contrasts$contrasts %>% 
+  as.data.frame() %>% 
+  filter(condition == "Repulsion") %>% 
+  pull(p.value)
+
+cat(sprintf("H2a (Repulsion: ε=0.40 > ε=0.50): %.3f vs %.3f (Δ=%+.3f, p=%.4f)\n",
+            rep_040, rep_050, h2a_delta, h2a_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(h2a_delta > 0 && h2a_pval < 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H2b: Tie-cutting shows minimal epsilon effect on dispersion
+tie_040 <- h2_df %>% filter(condition == "Tie-cutting", epsilon == 0.40) %>% pull(emmean)
+tie_050 <- h2_df %>% filter(condition == "Tie-cutting", epsilon == 0.50) %>% pull(emmean)
+h2b_delta <- tie_040 - tie_050
+h2b_pval <- h2_eps_contrasts$contrasts %>% 
+  as.data.frame() %>% 
+  filter(condition == "Tie-cutting") %>% 
+  pull(p.value)
+
+cat(sprintf("H2b (Tie-cutting: minimal ε effect): %.3f vs %.3f (Δ=%+.3f, p=%.4f)\n",
+            tie_040, tie_050, h2b_delta, h2b_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(abs(h2b_delta) < 0.02 || h2b_pval > 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H2c: Repulsion+Tiecut shows epsilon effect
+reptie_040 <- h2_df %>% filter(condition == "Repulsion+Tiecut", epsilon == 0.40) %>% pull(emmean)
+reptie_050 <- h2_df %>% filter(condition == "Repulsion+Tiecut", epsilon == 0.50) %>% pull(emmean)
+h2c_delta <- reptie_040 - reptie_050
+h2c_pval <- h2_eps_contrasts$contrasts %>% 
+  as.data.frame() %>% 
+  filter(condition == "Repulsion+Tiecut") %>% 
+  pull(p.value)
+
+cat(sprintf("H2c (Rep+Tiecut: ε=0.40 > ε=0.50): %.3f vs %.3f (Δ=%+.3f, p=%.4f)\n",
+            reptie_040, reptie_050, h2c_delta, h2c_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(h2c_delta > 0 && h2c_pval < 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H2d: Interaction significant
+int_pval <- h2_anova["condition:epsilon", "Pr(>F)"]
+int_f <- h2_anova["condition:epsilon", "F value"]
+
+cat(sprintf("H2d (Condition × Epsilon interaction): F=%.2f, p=%.4f\n", int_f, int_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(int_pval < 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+write_csv(as.data.frame(h2_anova), file.path(ANALYSIS_DIR, "h2_anova.csv"))
+write_csv(h2_df, file.path(ANALYSIS_DIR, "h2_emmeans.csv"))
+write_csv(as.data.frame(h2_eps_contrasts$contrasts), 
+          file.path(ANALYSIS_DIR, "h2_epsilon_effects.csv"))
+
+# ==============================================================================
+# RQ3 / H3: BLOC POLARIZATION
+# ==============================================================================
+
+cat("\n")
+cat(rep("-", 80), "\n", sep = "")
+cat("RQ3: Do disagreement response mechanisms increase bloc polarization?\n")
+cat(rep("-", 80), "\n\n")
+
+cat("HYPOTHESES:\n")
+cat("  H3a: Pure repulsion increases bloc polarization (PR > 1.0)\n")
+cat("  H3b: Pure tie-cutting increases bloc polarization (PR > 1.0)\n")
+cat("  H3c: Combined condition produces intermediate PR\n")
+cat("       (Tie-cutting < Repulsion+Tiecut < Repulsion)\n")
+cat("  H3d: Pure repulsion produces HIGHEST PR\n\n")
+
+cat("Note: PR = Between-bloc distance / Within-bloc distance\n")
+cat("      PR > 1.0 indicates between-bloc distance exceeds within-bloc cohesion\n\n")
+
+h3_model <- lmer(polarization_ratio ~ condition + (1|seed), data = df_primary)
+
+cat("--- MODEL SUMMARY ---\n")
+print(summary(h3_model))
+cat("\n")
+
+h3_anova <- anova(h3_model)
+cat("--- ANOVA (Type III) ---\n")
+print(h3_anova)
+cat("\n")
+
+h3_eta <- eta_squared(h3_anova, partial = TRUE)
+cat("--- EFFECT SIZE ---\n")
+print(h3_eta)
+cat("\n")
+
+h3_emm <- emmeans(h3_model, ~ condition)
+cat("--- ESTIMATED MARGINAL MEANS ---\n")
+print(h3_emm)
+cat("\n")
+
+h3_pairs <- pairs(h3_emm, adjust = "bonferroni")
+cat("--- PAIRWISE CONTRASTS ---\n")
+print(h3_pairs)
+cat("\n")
+
+h3_test <- test(h3_emm, null = 1.0, side = ">")
+cat("--- ONE-SAMPLE TESTS (PR > 1.0) ---\n")
+print(h3_test)
+cat("\n")
+
+h3_df <- as.data.frame(h3_emm)
+null_pr <- h3_df$emmean[h3_df$condition == "Null"]
+tiecut_pr <- h3_df$emmean[h3_df$condition == "Tie-cutting"]
+reptie_pr <- h3_df$emmean[h3_df$condition == "Repulsion+Tiecut"]
+rep_pr <- h3_df$emmean[h3_df$condition == "Repulsion"]
+
+cat("--- HYPOTHESIS EVALUATION ---\n\n")
+
+# H3a: Repulsion PR > 1.0
+h3a_pval <- h3_test$p.value[h3_test$condition == "Repulsion"]
+cat(sprintf("H3a (Repulsion PR > 1.0): PR=%.3f, p=%.4f\n", rep_pr, h3a_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(rep_pr > 1.0 && h3a_pval < 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H3b: Tie-cutting PR > 1.0
+h3b_pval <- h3_test$p.value[h3_test$condition == "Tie-cutting"]
+cat(sprintf("H3b (Tie-cutting PR > 1.0): PR=%.3f, p=%.4f\n", tiecut_pr, h3b_pval))
+cat(sprintf("     Result: %s\n\n", 
+            ifelse(tiecut_pr > 1.0 && h3b_pval < 0.05, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H3c: Ordering
+h3c_test <- tiecut_pr < reptie_pr && reptie_pr < rep_pr
+cat(sprintf("H3c (Tie-cutting < Rep+Tiecut < Repulsion): %.3f < %.3f < %.3f\n",
+            tiecut_pr, reptie_pr, rep_pr))
+cat(sprintf("     Result: %s\n\n", ifelse(h3c_test, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+# H3d: Repulsion = maximum
+h3d_test <- rep_pr == max(h3_df$emmean)
+cat(sprintf("H3d (Repulsion = max PR): PR=%.3f (max=%.3f)\n", rep_pr, max(h3_df$emmean)))
+cat(sprintf("     Result: %s\n\n", ifelse(h3d_test, "✓ SUPPORTED", "✗ NOT SUPPORTED")))
+
+write_csv(as.data.frame(h3_anova), file.path(ANALYSIS_DIR, "h3_anova.csv"))
+write_csv(as.data.frame(h3_emm), file.path(ANALYSIS_DIR, "h3_emmeans.csv"))
+write_csv(as.data.frame(h3_pairs), file.path(ANALYSIS_DIR, "h3_contrasts.csv"))
+write_csv(as.data.frame(h3_test), file.path(ANALYSIS_DIR, "h3_test_vs_1.csv"))
+
+# ==============================================================================
+# SUPPLEMENTARY ANALYSES
+# ==============================================================================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("SUPPLEMENTARY ANALYSES\n")
+cat(rep("=", 80), "\n\n")
+
+# Network fragmentation
+cat("--- NETWORK FRAGMENTATION ---\n\n")
+
+edges_model <- lmer(edges ~ condition + (1|seed), data = df_primary)
+edges_emm <- emmeans(edges_model, ~ condition)
+cat("Edges (network connectivity):\n")
+print(edges_emm)
+cat("\n")
+
+components_model <- lmer(components ~ condition + (1|seed), data = df_primary)
+components_emm <- emmeans(components_model, ~ condition)
+cat("Components (network fragmentation):\n")
+print(components_emm)
+cat("\n")
+
+modularity_model <- lmer(modularity ~ condition + (1|seed), data = df_primary)
+modularity_emm <- emmeans(modularity_model, ~ condition)
+cat("Modularity (bloc-based segregation):\n")
+print(modularity_emm)
+cat("\n")
+
+write_csv(as.data.frame(edges_emm), file.path(ANALYSIS_DIR, "edges_emmeans.csv"))
+write_csv(as.data.frame(components_emm), file.path(ANALYSIS_DIR, "components_emmeans.csv"))
+write_csv(as.data.frame(modularity_emm), file.path(ANALYSIS_DIR, "modularity_emmeans.csv"))
+
+# ==============================================================================
+# ROBUSTNESS CHECK: NETWORK TOPOLOGY
+# ==============================================================================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("ROBUSTNESS CHECK: NETWORK TOPOLOGY EFFECTS\n")
+cat(rep("=", 80), "\n\n")
+
+robust_model <- lmer(global_distance ~ condition * network + (1|seed), data = df_terminal)
+
+robust_anova <- anova(robust_model)
+cat("--- ANOVA (Condition × Network) ---\n")
+print(robust_anova)
+cat("\n")
+
+robust_emm <- emmeans(robust_model, ~ condition | network)
+cat("--- EMMs BY NETWORK TYPE ---\n")
+print(robust_emm)
+cat("\n")
+
+int_pval_robust <- robust_anova["condition:network", "Pr(>F)"]
+if (int_pval_robust < 0.05) {
+  cat("⚠ WARNING: Significant Condition × Network interaction detected\n")
+  cat("   Interpretation: Mechanism effects vary by network topology\n\n")
+} else {
+  cat("✓ No significant Condition × Network interaction\n")
+  cat("  Primary findings robust across network topologies\n\n")
+}
+
+write_csv(as.data.frame(robust_anova), file.path(ANALYSIS_DIR, "robustness_anova.csv"))
+write_csv(as.data.frame(robust_emm), file.path(ANALYSIS_DIR, "robustness_emmeans.csv"))
+
+# ==============================================================================
+# MODEL DIAGNOSTICS
+# ==============================================================================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("MODEL DIAGNOSTICS\n")
+cat(rep("=", 80), "\n\n")
+
+check_assumptions <- function(model, data, dv_name, model_name) {
+  
+  cat(sprintf("\n--- DIAGNOSTICS: %s ---\n\n", model_name))
+  
+  # 1. Normality of residuals
+  resids <- residuals(model)
+  sw_test <- shapiro.test(resids)
+  cat(sprintf("Shapiro-Wilk (residuals): W=%.4f, p=%.4f %s\n", 
+              sw_test$statistic, sw_test$p.value,
+              ifelse(sw_test$p.value > 0.05, "✓", "⚠")))
+  
+  # Q-Q plot
+  png(file.path(FIGURES_DIR, sprintf("%s_qqplot.png", model_name)),
+      width = 800, height = 600, res = 150)
+  qqnorm(resids, main = sprintf("Q-Q Plot: %s", model_name))
+  qqline(resids, col = "red", lwd = 2)
+  dev.off()
+  
+  # 2. Homogeneity of variance
+  lev_test <- tryCatch({
+    leveneTest(as.formula(paste(dv_name, "~ condition")), data = data)
+  }, error = function(e) NULL)
+  
+  if (!is.null(lev_test)) {
+    cat(sprintf("Levene's test: F=%.4f, p=%.4f %s\n", 
+                lev_test$`F value`[1], lev_test$`Pr(>F)`[1],
+                ifelse(lev_test$`Pr(>F)`[1] > 0.05, "✓", "⚠")))
+  }
+  
+  # 3. ICC
+  vc <- as.data.frame(VarCorr(model))
+  var_seed <- vc$vcov[vc$grp == "seed"]
+  var_resid <- vc$vcov[vc$grp == "Residual"]
+  icc <- var_seed / (var_seed + var_resid)
+  cat(sprintf("ICC: %.4f (%.1f%% variance from seed clustering) %s\n\n", 
+              icc, icc * 100, ifelse(icc > 0.05, "✓", "⚠")))
+  
+  invisible(list(shapiro = sw_test, levene = lev_test, icc = icc))
+}
+
+diag_h1 <- check_assumptions(h1_model, df_primary, "global_distance", "H1")
+diag_h2 <- check_assumptions(h2_model, df_primary, "global_distance", "H2")
+diag_h3 <- check_assumptions(h3_model, df_primary, "polarization_ratio", "H3")
+
+diag_summary <- tibble(
+  Hypothesis = c("H1", "H2", "H3"),
+  DV = c("Global Distance", "Global Distance", "Polarization Ratio"),
+  Shapiro_p = c(diag_h1$shapiro$p.value, diag_h2$shapiro$p.value, diag_h3$shapiro$p.value),
+  Levene_p = c(
+    ifelse(!is.null(diag_h1$levene), diag_h1$levene$`Pr(>F)`[1], NA),
+    ifelse(!is.null(diag_h2$levene), diag_h2$levene$`Pr(>F)`[1], NA),
+    ifelse(!is.null(diag_h3$levene), diag_h3$levene$`Pr(>F)`[1], NA)
+  ),
+  ICC = c(diag_h1$icc, diag_h2$icc, diag_h3$icc)
+) %>%
+  mutate(
+    Normality = ifelse(Shapiro_p > 0.05, "Pass", "Fail"),
+    Homogeneity = ifelse(Levene_p > 0.05 | is.na(Levene_p), "Pass", "Fail")
+  )
+
+cat("DIAGNOSTIC SUMMARY:\n")
+print(diag_summary)
+cat("\n")
+
+write_csv(diag_summary, file.path(ANALYSIS_DIR, "diagnostics_summary.csv"))
+
+# ==============================================================================
+# VISUALIZATIONS
+# ==============================================================================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("GENERATING FIGURES\n")
+cat(rep("=", 80), "\n\n")
+
+# Color palette
+cond_colors <- c(
+  "Null" = "gray60",
+  "Tie-cutting" = "steelblue",
+  "Repulsion+Tiecut" = "orange",
+  "Repulsion" = "red3"
+)
+
+# ============================ FIGURE 1: H1 - Global Distance ============================
+
+fig_h1 <- ggplot(as.data.frame(h1_emm), aes(x = condition, y = emmean, fill = condition)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+  scale_fill_manual(values = cond_colors) +
+  labs(
+    title = "H1: Global Opinion Dispersion by Mechanism",
+    subtitle = sprintf("Small-world networks (N = %d per condition)", 
+                       nrow(df_primary) / nlevels(df_primary$condition)),
+    x = NULL,
+    y = "Global Distance (estimated marginal mean)"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_h1_global_distance.png"),
+       fig_h1, width = 9, height = 6, dpi = 300)
+
+# ============================ FIGURE 2: H2 - Tolerance Interaction ============================
+
+fig_h2 <- ggplot(h2_df, aes(x = factor(epsilon), y = emmean, 
+                            color = condition, group = condition)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3.5, shape = 19) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.1, linewidth = 0.8) +
+  scale_color_manual(values = cond_colors) +
+  labs(
+    title = "H2: Tolerance Moderation Effect",
+    subtitle = "Condition × Epsilon interaction on global opinion dispersion",
+    x = "Tolerance Threshold (ε)",
+    y = "Global Distance (estimated marginal mean)",
+    color = "Condition"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_h2_interaction.png"),
+       fig_h2, width = 10, height = 6, dpi = 300)
+
+# ============================ FIGURE 3: H3 - Polarization Ratio ============================
+
+fig_h3 <- ggplot(as.data.frame(h3_emm), aes(x = condition, y = emmean, fill = condition)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray30", linewidth = 0.9) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+  scale_fill_manual(values = cond_colors) +
+  annotate("text", x = 3.5, y = 1.05, label = "Neutral (PR = 1.0)",
+           hjust = 0, size = 3.5, color = "gray30") +
+  labs(
+    title = "H3: Bloc Polarization (Polarization Ratio)",
+    subtitle = "PR = Between-bloc distance / Within-bloc distance",
+    x = NULL,
+    y = "Polarization Ratio (PR)"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_h3_polarization_ratio.png"),
+       fig_h3, width = 9, height = 6, dpi = 300)
+
+# ============================ FIGURE 4: Bloc Distance Decomposition ============================
+
+fig4_data <- df_primary %>%
+  pivot_longer(
+    cols = c(within_bloc_dist, between_bloc_dist),
+    names_to = "distance_type",
+    values_to = "value"
+  ) %>%
+  mutate(
+    distance_type = case_when(
+      distance_type == "within_bloc_dist" ~ "Within-bloc distance",
+      distance_type == "between_bloc_dist" ~ "Between-bloc distance",
+      TRUE ~ distance_type
+    )
+  )
+
+
+fig_decomp <- ggplot(fig4_data, aes(x = condition, y = value, fill = distance_type)) +
+  geom_violin(position = position_dodge(width = 0.85), alpha = 0.7, trim = FALSE) +
+  geom_boxplot(position = position_dodge(width = 0.85), width = 0.15,
+               outlier.shape = NA, alpha = 0.8) +
+  scale_fill_viridis_d(end = 0.85, option = "plasma") +
+  labs(
+    title = "Mechanisms of Bloc Polarization",
+    subtitle = "Between-bloc separation vs. within-bloc cohesion",
+    x = NULL,
+    y = "Opinion Distance",
+    fill = "Distance Type"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_bloc_decomposition.png"),
+       fig_decomp, width = 10, height = 6, dpi = 300)
+
+# ============================ FIGURE 5: Network Fragmentation ============================
+
+fig_edges <- ggplot(as.data.frame(edges_emm), aes(x = condition, y = emmean)) +
+  geom_col(fill = "darkgreen", alpha = 0.7, width = 0.65) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+  geom_hline(yintercept = 900, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Network Connectivity",
+    x = NULL,
+    y = "Edges (mean)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold", size = 11)
+  )
+
+fig_components <- ggplot(as.data.frame(components_emm), aes(x = condition, y = emmean)) +
+  geom_col(fill = "purple", alpha = 0.7, width = 0.65) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+  labs(
+    title = "Network Fragmentation",
+    x = NULL,
+    y = "Components (mean)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold", size = 11)
+  )
+
+fig_frag <- fig_edges + fig_components +
+  plot_annotation(
+    title = "Network Structural Outcomes",
+    subtitle = "Small-world networks",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 11)
+    )
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_fragmentation.png"),
+       fig_frag, width = 12, height = 5, dpi = 300)
+
+# ============================ FIGURE 6: Trajectory Over Time ============================
+
+traj_data <- df_full %>%
+  filter(network == "smallworld") %>%
+  group_by(tick, condition) %>%
+  summarise(
+    mean_gd = mean(global_distance, na.rm = TRUE),
+    se_gd = sd(global_distance, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = factor(condition,
+                      levels = c("null", "tiecut", "repulsiontiecut", "repulsion"),
+                      labels = c("Null", "Tie-cutting", "Repulsion+Tiecut", "Repulsion"))
+  )
+
+fig_traj <- ggplot(traj_data, aes(x = tick, y = mean_gd, color = condition)) +
+  geom_line(linewidth = 1.1) +
+  geom_ribbon(aes(ymin = mean_gd - 1.96 * se_gd,
+                  ymax = mean_gd + 1.96 * se_gd,
+                  fill = condition),
+              alpha = 0.15, color = NA) +
+  scale_color_manual(values = cond_colors) +
+  scale_fill_manual(values = cond_colors) +
+  labs(
+    title = "Polarization Dynamics Over Time",
+    subtitle = "Small-world networks (95% CI ribbons)",
+    x = "Simulation Tick",
+    y = "Mean Global Opinion Distance",
+    color = "Condition",
+    fill = "Condition"
+  ) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_trajectory.png"),
+       fig_traj, width = 11, height = 6, dpi = 300)
+
+# ============================ FIGURE 7: Robustness Check ============================
+
+fig_robust <- ggplot(as.data.frame(robust_emm), 
+                    aes(x = condition, y = emmean, fill = network)) +
+  geom_col(position = position_dodge(width = 0.85), alpha = 0.8, width = 0.75) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(width = 0.85), width = 0.25) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Robustness Check: Network Topology",
+    subtitle = "Condition effects across different network structures",
+    x = NULL,
+    y = "Global Distance (estimated marginal mean)",
+    fill = "Network Type"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_robustness.png"),
+       fig_robust, width = 11, height = 6, dpi = 300)
+
+# ============================ FIGURE 8: Terminal Distributions ============================
+
+fig_dist <- ggplot(df_primary, aes(x = condition, y = global_distance, fill = condition)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = cond_colors) +
+  labs(
+    title = "Terminal Global Distance Distribution",
+    subtitle = "Small-world networks (violin + boxplot)",
+    x = NULL,
+    y = "Terminal Global Opinion Distance"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig_distribution.png"),
+       fig_dist, width = 9, height = 6, dpi = 300)
+
+cat("✓ All figures saved to:", FIGURES_DIR, "\n\n")
+
+# ==============================================================================
+# SUMMARY TABLE
+# ==============================================================================
+
+cat(rep("=", 80), "\n", sep = "")
+cat("DESCRIPTIVE STATISTICS\n")
+cat(rep("=", 80), "\n\n")
+
+summary_table <- df_primary %>%
+  group_by(condition) %>%
+  summarise(
+    N = n(),
+    GD_Mean = round(mean(global_distance), 3),
+    GD_SD = round(sd(global_distance), 3),
+    PR_Mean = round(mean(polarization_ratio), 3),
+    PR_SD = round(sd(polarization_ratio), 3),
+    Within_Mean = round(mean(within_bloc_dist), 3),
+    Between_Mean = round(mean(between_bloc_dist), 3),
+    Edges_Mean = round(mean(edges), 0),
+    Components_Mean = round(mean(components), 1),
+    Modularity_Mean = round(mean(modularity), 3),
+    .groups = "drop"
+  )
+
+print(summary_table)
+cat("\n")
+
+write_csv(summary_table, file.path(ANALYSIS_DIR, "summary_table.csv"))
+
+# ==============================================================================
+# HYPOTHESIS SUMMARY TABLE
+# ==============================================================================
+
+hypothesis_summary <- tibble(
+  RQ = c("RQ1", "RQ1", "RQ1", "RQ2", "RQ2", "RQ2", "RQ2", 
+         "RQ3", "RQ3", "RQ3", "RQ3"),
+  Hypothesis = c("H1a", "H1b", "H1c", "H2a", "H2b", "H2c", "H2d",
+                 "H3a", "H3b", "H3c", "H3d"),
+  Description = c(
+    "Repulsion produces highest dispersion",
+    "Tie-cutting ≈ Null dispersion",
+    "Null < Rep+Tie < Repulsion ordering",
+    "Lower ε amplifies repulsion effect",
+    "Lower ε has minimal effect on tie-cutting",
+    "Lower ε amplifies combined effect",
+    "Significant Condition × Epsilon interaction",
+    "Repulsion PR > 1.0",
+    "Tie-cutting PR > 1.0",
+    "Tie-cutting < Rep+Tie < Repulsion ordering",
+    "Repulsion produces highest PR"
+  ),
+  Result = c(
+    ifelse(h1a_test, "Supported", "Not Supported"),
+    ifelse(h1b_test, "Supported", "Not Supported"),
+    ifelse(h1c_test, "Supported", "Not Supported"),
+    ifelse(h2a_delta > 0 && h2a_pval < 0.05, "Supported", "Not Supported"),
+    ifelse(abs(h2b_delta) < 0.02 || h2b_pval > 0.05, "Supported", "Not Supported"),
+    ifelse(h2c_delta > 0 && h2c_pval < 0.05, "Supported", "Not Supported"),
+    ifelse(int_pval < 0.05, "Supported", "Not Supported"),
+    ifelse(rep_pr > 1.0 && h3a_pval < 0.05, "Supported", "Not Supported"),
+    ifelse(tiecut_pr > 1.0 && h3b_pval < 0.05, "Supported", "Not Supported"),
+    ifelse(h3c_test, "Supported", "Not Supported"),
+    ifelse(h3d_test, "Supported", "Not Supported")
+  )
+)
+
+cat(rep("=", 80), "\n", sep = "")
+cat("HYPOTHESIS TESTING SUMMARY\n")
+cat(rep("=", 80), "\n\n")
+print(hypothesis_summary)
+cat("\n")
+
+write_csv(hypothesis_summary, file.path(ANALYSIS_DIR, "hypothesis_summary.csv"))
+
+# ==============================================================================
+# FINAL SUMMARY
+# ==============================================================================
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("ANALYSIS COMPLETE\n")
+cat(rep("=", 80), "\n\n")
+
+cat("Output directory:", ANALYSIS_DIR, "\n\n")
+
+cat("Files saved:\n")
+cat("  CSV outputs:\n")
+cat("    - h1_anova.csv, h1_emmeans.csv, h1_contrasts.csv, h1_cohens_d.csv\n")
+cat("    - h2_anova.csv, h2_emmeans.csv, h2_epsilon_effects.csv\n")
+cat("    - h3_anova.csv, h3_emmeans.csv, h3_contrasts.csv, h3_test_vs_1.csv\n")
+cat("    - edges_emmeans.csv, components_emmeans.csv, modularity_emmeans.csv\n")
+cat("    - robustness_anova.csv, robustness_emmeans.csv\n")
+cat("    - diagnostics_summary.csv\n")
+cat("    - summary_table.csv\n")
+cat("    - hypothesis_summary.csv\n\n")
+
+cat("  Figures:\n")
+cat("    - fig_h1_global_distance.png\n")
+cat("    - fig_h2_interaction.png\n")
+cat("    - fig_h3_polarization_ratio.png\n")
+cat("    - fig_bloc_decomposition.png\n")
+cat("    - fig_fragmentation.png\n")
+cat("    - fig_trajectory.png\n")
+cat("    - fig_robustness.png\n")
+cat("    - fig_distribution.png\n")
+cat("    - H1_qqplot.png, H2_qqplot.png, H3_qqplot.png\n\n")
+
+cat(rep("=", 80), "\n", sep = "")
+cat("✓ READY FOR THESIS REPORTING\n")
+cat(rep("=", 80), "\n")
+
+```
