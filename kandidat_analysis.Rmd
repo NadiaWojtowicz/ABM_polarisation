@@ -1,0 +1,901 @@
+---
+title: "Untitled"
+author: "nadia"
+date: "2025-11-26"
+output: html_document
+---
+---
+title: "Candidate Political Positioning Analysis"
+author: "nadia"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+    fontsize: 11pt
+---
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6)
+
+#Load all required libraries
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(factoextra)
+library(psych)
+library(caret)
+library(randomForest)
+library(nnet)
+library(MASS)
+library(fastshap)
+library(tibble)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(visNetwork)
+library(viridis)
+library(pheatmap)
+library(ggcorrplot)
+library(vip)
+library(fpc)
+library(stringr)
+library(cluster)
+
+
+
+#Set seed for reproducibility
+set.seed(123)
+
+#Helper functions
+make_safe_levels <- function(f) {
+safe_levels <- make.names(levels(f))
+factor(make.names(as.character(f)), levels = safe_levels)
+}
+
+#Min-max normalization to 0-1 scale
+normalize_01 <- function(x) {
+(x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+
+
+# Data Loading and Initial Cleaning
+
+#Load data
+df <- read_csv("C:/Users/nadia/Desktop/pilot/altinget_answers_playwright_271.csv",
+show_col_types = FALSE)
+
+#Normalize candidate name column
+if (!"candidate_name" %in% names(df) & "name" %in% names(df)) {
+df <- rename(df, candidate_name = name)
+}
+
+#Detect question columns (Q1-Q26)
+question_cols <- grep("^Q", names(df), value = TRUE)
+cat("Detected", length(question_cols), "question columns\n")
+
+#Initial filtering: complete cases only
+before_n <- nrow(df)
+df <- df %>%
+filter(!is.na(party) & party != "") %>%
+filter(if_all(all_of(question_cols), ~ !is.na(.))) %>%
+mutate(across(all_of(question_cols), as.numeric))
+
+cat("Rows before filtering:", before_n, "\n")
+cat("Rows after filtering:", nrow(df), "\n")
+
+
+# Exploratory Data Analysis (Pre-Filtering)
+
+## Response Distributions
+
+#Summary statistics for all questions
+summary(select(df, all_of(question_cols)))
+
+#Visualize response distributions
+df_long <- df %>%
+pivot_longer(all_of(question_cols), names_to = "Question", values_to = "Value")
+
+ggplot(df_long, aes(x = Value)) +
+geom_histogram(binwidth = 0.5, color = "white", fill = "steelblue") +
+facet_wrap(~Question, scales = "free_y", ncol = 5) +
+theme_minimal() +
+labs(title = "Distribution of Responses Across All Questions",
+x = "Response (-2 to 2)", y = "Count")
+
+
+## Party Distribution (Before Filtering)
+
+#Count candidates per party
+party_counts <- df %>%
+count(party, name = "n") %>%
+arrange(desc(n))
+
+print(party_counts)
+
+ggplot(party_counts, aes(x = reorder(party, n), y = n)) +
+geom_col(fill = "steelblue") +
+geom_hline(yintercept = 13, linetype = "dashed", color = "red") +
+coord_flip() +
+theme_minimal() +
+labs(title = "Candidates per Party (Red line = threshold of 13)",
+x = "Party", y = "Number of Candidates")
+
+
+## Mean and Median Responses by Party (Pre-Filtering)
+
+#Calculate mean and median for each party-question combination
+party_summary <- df %>%
+group_by(party) %>%
+summarise(across(all_of(question_cols),
+list(mean = ~mean(.x, na.rm=TRUE),
+median = ~median(.x, na.rm=TRUE))),
+.groups = "drop")
+
+#Create mean matrix for heatmap
+mean_long <- party_summary %>%
+select(party, ends_with("_mean")) %>%
+pivot_longer(-party, names_to = "Question", values_to = "Mean") %>%
+mutate(Question = str_remove(Question, "_mean"))
+
+ggplot(mean_long, aes(x = Question, y = party, fill = Mean)) +
+geom_tile() +
+scale_fill_viridis_c(option = "magma") +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8)) +
+labs(title = "Mean Responses by Party (All Parties)")
+
+#Create median matrix for heatmap
+median_long <- party_summary %>%
+select(party, ends_with("_median")) %>%
+pivot_longer(-party, names_to = "Question", values_to = "Median") %>%
+mutate(Question = str_remove(Question, "_median"))
+
+ggplot(median_long, aes(x = Question, y = party, fill = Median)) +
+geom_tile() +
+scale_fill_viridis_c(option = "magma") +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8)) +
+labs(title = "Median Responses by Party (All Parties)")
+
+
+
+## Question Variance Analysis
+
+#Compute variance and SD per question
+variance_df <- df %>%
+select(all_of(question_cols)) %>%
+summarise(across(everything(), var, na.rm = TRUE)) %>%
+pivot_longer(cols = everything(), names_to = "Question", values_to = "Variance")
+
+sd_df <- df %>%
+select(all_of(question_cols)) %>%
+summarise(across(everything(), sd, na.rm = TRUE)) %>%
+pivot_longer(cols = everything(), names_to = "Question", values_to = "SD")
+
+variance_summary <- variance_df %>%
+left_join(sd_df, by = "Question") %>%
+arrange(desc(Variance))
+
+print(variance_summary)
+
+ggplot(variance_summary, aes(x = reorder(Question, Variance), y = Variance)) +
+geom_col(fill = "darkred") +
+coord_flip() +
+theme_minimal() +
+labs(title = "Question Variance (Higher = More Disagreement)",
+x = "Question", y = "Variance")
+
+
+# Internal Consistency and Item Analysis
+
+#Correlation matrix of questions
+corr_matrix <- cor(select(df, all_of(question_cols)), use = "pairwise.complete.obs")
+
+ggcorrplot(corr_matrix, lab = FALSE,
+title = "Correlation Matrix of Questions (Q1-Q26)")
+
+#Cronbach's alpha with automatic key checking
+alpha_initial <- psych::alpha(select(df, all_of(question_cols)),
+check.keys = TRUE)
+
+cat("\n=== CRONBACH'S ALPHA (BEFORE REVERSAL) ===\n")
+print(alpha_initial$total)
+
+#Extract item statistics
+item_stats <- alpha_initial$item.stats %>%
+rownames_to_column("Question") %>%
+as_tibble() %>%
+arrange(r.drop)
+
+print(item_stats %>% select(Question, r.drop, raw.r))
+
+#Programmatic reversal of negatively correlated items
+items_to_reverse <- item_stats %>%
+filter(r.drop < 0) %>%
+pull(Question)
+
+if (length(items_to_reverse) > 0) {
+cat("\nReversing items with negative item-total correlation:",
+paste(items_to_reverse, collapse = ", "), "\n")
+
+df <- df %>%
+mutate(across(all_of(items_to_reverse), ~ -1 * .x))
+
+#Recalculate alpha after reversal
+alpha_after <- psych::alpha(df %>% select(all_of(question_cols)),
+check.keys = TRUE)
+cat("\n=== CRONBACH'S ALPHA (AFTER REVERSAL) ===\n")
+print(alpha_after$total)
+} else {
+cat("\nNo items required reversal.\n")
+}
+
+
+# Party Filtering (Threshold = 13)
+
+#Filter parties with at least 13 candidates
+threshold <- 13
+valid_parties <- party_counts %>%
+filter(n >= threshold) %>%
+pull(party)
+
+cat("Keeping parties with >=", threshold, "candidates:",
+paste(valid_parties, collapse = ", "), "\n")
+
+df <- df %>%
+filter(party %in% valid_parties) %>%
+mutate(party = droplevels(factor(party)))
+
+cat("Remaining observations:", nrow(df), "\n")
+cat("Remaining parties:", length(levels(df$party)), "\n")
+
+
+
+# Principal Component Analysis (PCA)
+
+## PCA Computation and Variance Explained
+
+#Prepare scaled matrix for PCA
+question_matrix <- df %>%
+select(all_of(question_cols)) %>%
+as.matrix() %>%
+scale()
+
+#Perform PCA
+pca <- prcomp(question_matrix, center = TRUE, scale. = TRUE)
+
+#Extract eigenvalues
+eig <- factoextra::get_eigenvalue(pca)
+cat("\n=== VARIANCE EXPLAINED BY PRINCIPAL COMPONENTS ===\n")
+print(eig[1:6, ])
+
+#Store PC1 and PC2 variance percentages
+pc1_pct <- eig[1, "variance.percent"]
+pc2_pct <- eig[2, "variance.percent"]
+
+#Scree plot
+fviz_eig(pca, addlabels = TRUE, ylim = c(0, 60)) +
+labs(title = "Scree Plot: Variance Explained by Each PC")
+
+
+## PCA Loadings Analysis
+
+#Extract loadings
+loadings <- as.data.frame(pca$rotation) %>%
+rownames_to_column("Question")
+
+#Top questions for PC1 (ideological dimension)
+top_PC1 <- loadings %>%
+arrange(desc(abs(PC1))) %>%
+slice_head(n = 15)
+
+#Top questions for PC2
+top_PC2 <- loadings %>%
+arrange(desc(abs(PC2))) %>%
+slice_head(n = 15)
+
+cat("\n=== TOP 15 QUESTIONS DEFINING PC1 (Main Ideological Dimension) ===\n")
+print(top_PC1%>% select(Question, PC1))
+
+cat("\n=== TOP 15 QUESTIONS DEFINING PC2 ===\n")
+print(top_PC2%>% select(Question, PC2))
+
+#Visualize loadings
+ggplot(loadings, aes(x = PC1, y = PC2, label = Question)) +
+geom_point(alpha = 0.7, color = "darkblue") +
+geom_text(size = 2.5, hjust = -0.1, vjust = -0.1) +
+theme_minimal() +
+labs(title = "Question Loadings on PC1 and PC2")
+
+
+
+## Candidate Positioning in PC Space
+
+#Extract candidate scores
+candidate_scores <- as.data.frame(pca$x) %>%
+mutate(candidate_name = df$candidate_name,
+party = df$party)
+
+#Calculate party centroids
+party_centroids <- candidate_scores %>%
+group_by(party) %>%
+summarise(across(starts_with("PC"), mean),
+n = n(),
+.groups = "drop")
+
+#Calculate distance from party centroid for each candidate
+candidate_scores <- candidate_scores %>%
+left_join(party_centroids %>%
+select(party, PC1_cent = PC1, PC2_cent = PC2),
+by = "party") %>%
+mutate(distance_from_party = sqrt((PC1 - PC1_cent)^2 + (PC2 - PC2_cent)^2))
+
+#Plot: PC1 vs PC2 with party colors and ellipses
+groups_with_enough <- candidate_scores %>%
+count(party) %>%
+filter(n >= 3) %>%
+pull(party)
+
+ggplot(candidate_scores, aes(x = PC1, y = PC2, color = party)) +
+geom_point(size = 3, alpha = 0.7) +
+stat_ellipse(data = candidate_scores %>% filter(party %in% groups_with_enough),
+aes(group = party), level = 0.68, linewidth = 0.9) +
+theme_minimal() +
+labs(title = "Candidate Positioning in PC1-PC2 Space",
+subtitle = paste0("PC1: ", round(pc1_pct, 1), "%; PC2: ", round(pc2_pct, 1), "%"))
+
+#Faceted view by party
+ggplot(candidate_scores, aes(x = PC1, y = PC2)) +
+geom_point(aes(color = party), size = 3, alpha = 0.7) +
+facet_wrap(~party, scales = "free") +
+theme_minimal() +
+scale_color_brewer(palette = "Set2") +
+labs(title = "Ideological Spread Within Each Party") +
+theme(strip.text = element_text(face = "bold", size = 11))
+
+#Violin plot: PC1 distribution by party
+ggplot(candidate_scores, aes(x = party, y = PC1, fill = party)) +
+geom_violin(alpha = 0.7, trim = FALSE) +
+geom_boxplot(width = 0.2, fill = "white") +
+geom_jitter(width = 0.1, size = 1.5, alpha = 0.5) +
+coord_flip() +
+theme_minimal() +
+scale_fill_brewer(palette = "Set2") +
+labs(title = "PC1 Distribution by Party (Main Ideological Axis)") +
+theme(legend.position = "none")
+
+#Ideological spread within parties
+ggplot(candidate_scores, aes(x = party, y = distance_from_party, fill = party)) +
+geom_violin(alpha = 0.7) +
+geom_boxplot(width = 0.2, fill = "white") +
+coord_flip() +
+theme_minimal() +
+scale_fill_brewer(palette = "Set2") +
+labs(title = "Ideological Spread Within Parties (Distance from Centroid)",
+y = "Distance from Party Centroid") +
+theme(legend.position = "none")
+
+
+
+## Statistical Testing: Party Differences on PC1
+
+#ANOVA: Do parties differ on PC1?
+anova_pc1 <- aov(PC1 ~ party, data = candidate_scores)
+cat("\n=== ANOVA: PC1 ~ Party ===\n")
+print(summary(anova_pc1))
+
+#Post-hoc comparisons
+cat("\n=== Tukey HSD Post-Hoc Comparisons ===\n")
+print(TukeyHSD(anova_pc1))
+
+#Check homogeneity of variance
+if (requireNamespace("car", quietly = TRUE)) {
+cat("\n=== Levene's Test for Homogeneity of Variance ===\n")
+print(car::leveneTest(PC1 ~ party, data = candidate_scores))
+}
+
+
+
+# Clustering Analysis
+
+## Optimal Number of Clusters (Candidate-Level)
+
+#Use first 6 PCs for clustering
+pc_matrix <- candidate_scores %>%
+select(starts_with("PC")) %>%
+select(PC1:PC6) %>%
+as.matrix()
+
+#Determine optimal k using silhouette method
+k_max <- min(10, nrow(pc_matrix) - 1)
+fviz_nbclust(pc_matrix, FUN = kmeans, method = "silhouette", k.max = k_max) +
+labs(title = "Optimal Number of Clusters (Silhouette Method)")
+
+#Perform k-means with k=2 (based on typical left-right split)
+k_cand <- 2
+set.seed(123)
+kmeans_model <- kmeans(pc_matrix, centers = k_cand, nstart = 50)
+
+candidate_scores$cluster_cand <- factor(kmeans_model$cluster)
+
+#Silhouette diagnostic
+sil <- silhouette(as.numeric(candidate_scores$cluster_cand), dist(pc_matrix))
+plot(sil, main = "Silhouette Plot for Candidate Clusters")
+
+#Cluster composition by party
+cat("\n=== Cluster Composition by Party ===\n")
+print(table(candidate_scores$cluster_cand, candidate_scores$party))
+
+#Visualize clusters
+ggplot(candidate_scores, aes(x = PC1, y = PC2, color = cluster_cand)) +
+geom_point(size = 3, alpha = 0.7) +
+theme_minimal() +
+labs(title = paste("K-means Clustering (k =", k_cand, ")"),
+subtitle = "Clusters based on PC1-PC6")
+
+#Clusters with party overlaid
+ggplot(candidate_scores, aes(x = PC1, y = PC2, color = party, shape = cluster_cand)) +
+geom_point(size = 3, alpha = 0.7) +
+theme_minimal() +
+labs(title = paste("Clusters with Party Labels (k =", k_cand, ")"))
+
+
+
+## Jaccard Stability Analysis
+
+#Bootstrap stability of clusters using Jaccard index
+set.seed(123)
+clust_boot <- fpc::clusterboot(pc_matrix, B = 100,
+clustermethod = kmeansCBI,
+krange = k_cand,
+seed = 123)
+
+cat("\n=== Jaccard Stability (Bootstrap) ===\n")
+cat("Mean Jaccard coefficient per cluster:\n")
+print(clust_boot$bootmean)
+cat("\nNote: Values > 0.75 indicate stable clusters\n")
+
+
+
+# Predictive Modeling with Nested CV (NO DATA LEAKAGE)
+
+## Prepare Full Dataset for CV
+
+#Use entire filtered dataset (n=105) with cross-validation
+#NO train/test split - CV provides unbiased estimates
+X_full <- df %>% select(all_of(question_cols))
+y_full_pretty <- factor(df$party)
+y_full <- make_safe_levels(y_full_pretty)
+
+cat("Total observations for nested CV:", nrow(X_full), "\n")
+cat("Number of classes:", length(levels(y_full)), "\n")
+cat("Observations per class:\n")
+print(table(y_full_pretty))
+
+
+## Outer CV Loop: Performance Estimation
+
+#Outer loop: 10-fold CV repeated 5 times for stable performance estimates
+#This gives us 50 performance measurements per model
+outer_ctrl <- trainControl(
+method = "repeatedcv",
+number = 10, # 10-fold CV (each fold ~10-11 observations)
+repeats = 5, # Repeat 5 times for stability
+classProbs = TRUE,
+summaryFunction = defaultSummary, # Better metrics for multi-class
+savePredictions = "final",
+verboseIter = FALSE
+)
+
+cat("Outer CV configuration:\n")
+cat(" Method: 10-fold CV repeated 5 times\n")
+cat(" Total model fits per algorithm: 50\n")
+cat(" Each test fold: ~", round(nrow(X_full)/10), "observations\n")
+
+
+
+## Train Models with Nested CV
+
+#Random Forest with nested CV
+set.seed(123)
+rf_cv <- train(
+x = X_full,
+y = y_full,
+method = "rf",
+trControl = outer_ctrl,
+tuneLength = 5,
+metric = "Accuracy",
+importance = TRUE
+)
+
+cat("\n=== RANDOM FOREST: 10-FOLD CV (REPEATED 5x) ===\n")
+print(rf_cv)
+cat("\nBest mtry:", rf_cv$bestTune$mtry, "\n")
+
+#SVM Radial
+set.seed(123)
+svm_cv <- train(
+x = X_full,
+y = y_full,
+method = "svmRadial",
+preProcess = c("center", "scale"),
+trControl = outer_ctrl,
+tuneLength = 5,
+metric = "Accuracy"
+)
+
+cat("\n=== SVM RADIAL: 10-FOLD CV (REPEATED 5x) ===\n")
+print(svm_cv)
+
+#Multinomial Logistic Regression
+set.seed(123)
+lr_cv <- train(
+x = X_full,
+y = y_full,
+method = "multinom",
+preProcess = c("center", "scale"),
+trControl = outer_ctrl,
+tuneLength = 3,
+metric = "Accuracy",
+trace = FALSE
+)
+
+cat("\n=== MULTINOMIAL LOGISTIC REGRESSION: 10-FOLD CV (REPEATED 5x) ===\n")
+print(lr_cv)
+
+
+
+## Model Comparison
+
+#Compare all models
+results <- resamples(list(
+RandomForest = rf_cv,
+SVM = svm_cv,
+LogisticRegression = lr_cv
+))
+
+cat("\n=== MODEL COMPARISON (50 CV ITERATIONS EACH) ===\n")
+summary(results)
+
+#Visualize
+bwplot(results, main = "Model Comparison: 10-Fold CV (Repeated 5x)")
+dotplot(results, main = "Model Performance Distributions")
+
+#Statistical comparison
+cat("\n=== STATISTICAL SIGNIFICANCE TESTS ===\n")
+diff_results <- diff(results)
+summary(diff_results)
+
+
+
+## Report Final Performance with Confidence Intervals
+
+#Extract CV results with confidence intervals
+get_cv_stats <- function(model, model_name) {
+cv_results <- model$resample
+
+tibble(
+Model = model_name,
+Mean_Accuracy = mean(cv_results$Accuracy),
+SD_Accuracy = sd(cv_results$Accuracy),
+CI_Lower = mean(cv_results$Accuracy) - 1.96 * sd(cv_results$Accuracy) / sqrt(nrow(cv_results)),
+CI_Upper = mean(cv_results$Accuracy) + 1.96 * sd(cv_results$Accuracy) / sqrt(nrow(cv_results)),
+Mean_Kappa = mean(cv_results$Kappa),
+SD_Kappa = sd(cv_results$Kappa)
+)
+}
+
+performance_summary <- bind_rows(
+get_cv_stats(rf_cv, "Random Forest"),
+get_cv_stats(svm_cv, "SVM Radial"),
+get_cv_stats(lr_cv, "Logistic Regression")
+)
+
+cat("\n=== FINAL MODEL PERFORMANCE (WITH 95% CI) ===\n")
+print(performance_summary, digits = 3)
+
+#Select best model
+best_model_name <- performance_summary$Model[which.max(performance_summary$Mean_Accuracy)]
+best_model <- switch(best_model_name,
+"Random Forest" = rf_cv,
+"SVM Radial" = svm_cv,
+"Logistic Regression" = lr_cv)
+
+cat("\n==> BEST MODEL:", best_model_name, "\n")
+cat(" Mean CV Accuracy:", round(max(performance_summary$Mean_Accuracy), 3), "\n")
+
+
+# Feature Importance Analysis (NO LEAKAGE)
+
+## Strategy: Bootstrap Stability Selection
+
+#Bootstrap feature importance across CV folds
+#This ensures features are selected WITHOUT seeing full dataset
+cat("\n=== FEATURE IMPORTANCE: BOOTSTRAP STABILITY APPROACH ===\n")
+cat("Computing importance across 100 bootstrap samples...\n")
+
+set.seed(123)
+n_boot <- 100
+importance_boot <- matrix(NA, nrow = n_boot, ncol = length(question_cols))
+colnames(importance_boot) <- question_cols
+
+for (i in 1:n_boot) {
+
+#Bootstrap sample
+boot_idx <- sample(1:nrow(X_full), replace = TRUE)
+X_boot <- X_full[boot_idx, ]
+y_boot <- y_full[boot_idx]
+
+#Fit RF and extract importance
+rf_boot <- randomForest(x = X_boot, y = y_boot, importance = TRUE, ntree = 500)
+
+#Get mean importance across classes
+imp_matrix <- importance(rf_boot, type = 1) # Mean decrease in accuracy
+importance_boot[i, ] <- rowMeans(as.matrix(imp_matrix))
+
+if (i %% 20 == 0) cat(" Completed", i, "/ 100 bootstrap samples\n")
+}
+
+#Calculate stable importance metrics
+importance_stable <- tibble(
+Question = colnames(importance_boot),
+Mean_Importance = colMeans(importance_boot),
+SD_Importance = apply(importance_boot, 2, sd),
+CI_Lower = colMeans(importance_boot) - 1.96 * apply(importance_boot, 2, sd),
+CI_Upper = colMeans(importance_boot) + 1.96 * apply(importance_boot, 2, sd),
+Stability = apply(importance_boot, 2, function(x) sum(x > median(importance_boot)) / n_boot)
+) %>%
+arrange(desc(Mean_Importance))
+
+cat("\n=== TOP 15 FEATURES: BOOTSTRAP STABLE IMPORTANCE ===\n")
+print(importance_stable %>% slice_head(n = 15))
+
+ggplot(importance_stable[1:15,], aes(x = reorder(Question, Mean_Importance),
+y = Mean_Importance)) +
+geom_col(fill = "darkgreen") +
+geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2) +
+coord_flip() +
+theme_minimal() +
+labs(title = "Top 15 Features: Bootstrap Stable Importance (n=100)",
+subtitle = "Error bars = 95% CI",
+x = "Question", y = "Mean Importance")
+
+
+
+## Alternative: Permutation Importance (CV-Based)
+
+#Compute permutation importance within CV framework
+cat("\n=== FEATURE IMPORTANCE: CV-BASED PERMUTATION ===\n")
+
+set.seed(123)
+vi_perm_cv <- vip::vi_permute(
+object = best_model,
+feature_names = question_cols,
+train = as.data.frame(lapply(X_full, as.numeric)),
+target = y_full,
+metric = "Accuracy",
+nsim = 50,
+pred_wrapper = function(object, newdata) predict(object, newdata = newdata)
+)
+
+vi_perm_cv <- vi_perm_cv %>%
+rename(Question = Variable, Perm_Importance = Importance) %>%
+arrange(desc(Perm_Importance))
+
+cat("\n=== TOP 15 FEATURES: PERMUTATION IMPORTANCE ===\n")
+print(vi_perm_cv %>% slice_head(n = 15))
+
+ggplot(vi_perm_cv[1:15,], aes(x = reorder(Question, Perm_Importance),
+y = Perm_Importance)) +
+geom_col(fill = "darkorange") +
+coord_flip() +
+theme_minimal() +
+labs(title = "Top 15 Features: Permutation Importance",
+x = "Question", y = "Accuracy Drop")
+
+
+## SHAP Values (Full Dataset - Descriptive Only)
+
+#SHAP on full model for interpretation (not for selection)
+#ACKNOWLEDGE: This uses full dataset, so for INTERPRETATION not SELECTION
+cat("\n=== SHAP VALUES: GLOBAL FEATURE IMPORTANCE (INTERPRETIVE) ===\n")
+cat("NOTE: SHAP computed on full dataset for interpretation only.\n")
+cat("Feature SELECTION uses bootstrap/permutation methods above.\n\n")
+
+rf_final <- best_model$finalModel
+X_numeric <- as.data.frame(lapply(X_full, as.numeric))
+
+predict_wrap <- function(object, newdata) {
+as.matrix(predict(object, newdata = newdata, type = "prob"))
+}
+
+set.seed(123)
+bg_idx <- sample(1:nrow(X_numeric), min(100, nrow(X_numeric)))
+bg <- X_numeric[bg_idx, ]
+
+set.seed(123)
+shap_values <- fastshap::explain(
+object = rf_final,
+X = X_numeric,
+pred_wrapper = predict_wrap,
+nsim = 100,
+newdata = bg
+)
+
+if (is.list(shap_values)) {
+shap_mat <- Reduce("+", lapply(shap_values, abs)) / length(shap_values)
+} else {
+shap_mat <- abs(shap_values)
+}
+
+shap_summary <- tibble(
+Question = colnames(shap_mat),
+Mean_SHAP = colMeans(shap_mat, na.rm = TRUE)
+) %>%
+arrange(desc(Mean_SHAP))
+
+cat("\n=== TOP 15 FEATURES: MEAN |SHAP| ===\n")
+print(shap_summary %>% slice_head(n = 15))
+
+ggplot(shap_summary[1:15,], aes(x = reorder(Question, Mean_SHAP), y = Mean_SHAP)) +
+geom_col(fill = "darkred") +
+coord_flip() +
+theme_minimal() +
+labs(title = "Top 15 Features: Mean Absolute SHAP",
+subtitle = "Computed on full dataset (interpretive use only)",
+x = "Question", y = "Mean |SHAP|")
+
+
+
+## Consensus Ranking (Properly Weighted)
+
+#Combine bootstrap and permutation importance (both CV-based)
+#SHAP included but weighted lower since it uses full data
+consensus_df <- importance_stable %>%
+select(Question, Bootstrap_Imp = Mean_Importance) %>%
+left_join(vi_perm_cv %>% select(Question, Perm_Importance), by = "Question") %>%
+left_join(shap_summary %>% select(Question, SHAP = Mean_SHAP), by = "Question") %>%
+mutate(
+# Normalize to 0-1
+Bootstrap_norm = normalize_01(Bootstrap_Imp),
+Perm_norm = normalize_01(Perm_Importance),
+SHAP_norm = normalize_01(SHAP),
+
+
+# Consensus: Bootstrap=50%, Permutation=40%, SHAP=10%
+# (Lower weight for SHAP since it uses full data)
+Consensus_Score = 0.50 * Bootstrap_norm + 
+                  0.40 * Perm_norm + 
+                  0.10 * SHAP_norm
+) %>%
+arrange(desc(Consensus_Score))
+
+cat("\n=== CONSENSUS FEATURE RANKING (NO LEAKAGE) ===\n")
+cat("Weights: Bootstrap=50%, Permutation=40%, SHAP=10%\n\n")
+print(consensus_df %>%
+select(Question, Consensus_Score, Bootstrap_norm, Perm_norm, SHAP_norm) %>%
+slice_head(n = 15))
+
+ggplot(consensus_df[1:15,], aes(x = reorder(Question, Consensus_Score),
+y = Consensus_Score)) +
+geom_col(fill = "purple") +
+coord_flip() +
+theme_minimal() +
+labs(title = "Top 15 Questions: Consensus Ranking (No Data Leakage)",
+subtitle = "Bootstrap 50% + Permutation 40% + SHAP 10%",
+x = "Question", y = "Consensus Score")
+
+#Extract top 10 for survey use
+top10_questions <- consensus_df$Question[1:10]
+cat("\n=== TOP 10 MOST DISCRIMINATING QUESTIONS (FOR SURVEY) ===\n")
+cat(paste(top10_questions, collapse = ", "), "\n")
+cat("\nThese questions selected using CV-based methods (no data leakage).\n")
+
+
+
+# Network Analysis: Direction Agreement
+
+#Build network based on direction agreement (sign concordance)
+build_direction_network <- function(question_subset, data_df,
+threshold = 0.7, title = NULL) {
+
+#Extract answer direction (sign)
+A <- sign(as.matrix(select(data_df, all_of(question_subset))))
+n_nodes <- nrow(A)
+
+#Calculate pairwise direction agreement
+edges <- list()
+idx <- 1
+for (i in 1:(n_nodes-1)) {
+for (j in (i+1):n_nodes) {
+agreement <- mean(A[i, ] == A[j, ], na.rm = TRUE)
+if (!is.na(agreement) && agreement >= threshold) {
+edges[[idx]] <- data.frame(from = i, to = j, weight = agreement)
+idx <- idx + 1
+}
+}
+}
+
+if (length(edges) == 0) {
+message("No edges above threshold for ", title)
+return(NULL)
+}
+
+edges_df <- bind_rows(edges)
+
+nodes_df <- tibble(
+id = 1:n_nodes,
+label = data_df$candidate_name,
+party = data_df$party,
+title = paste0(data_df$candidate_name, " (", data_df$party, ")")
+)
+
+g <- igraph::graph_from_data_frame(edges_df, vertices = nodes_df, directed = FALSE)
+
+#Assign colors by party
+parties <- sort(unique(nodes_df$party))
+pal <- viridis::turbo(length(parties))
+party_col_map <- setNames(pal, parties)
+V(g)$color <- party_col_map[as.character(V(g)$party)]
+
+#Plot network
+p <- ggraph(g, layout = "fr") +
+geom_edge_link(aes(width = weight), alpha = 0.5, color = "grey60") +
+geom_node_point(aes(color = party), size = 3) +
+geom_node_text(aes(label = label), repel = TRUE, size = 2.5) +
+scale_color_manual(values = party_col_map) +
+scale_edge_width(range = c(0.5, 2)) +
+theme_void() +
+labs(title = title)
+
+print(p)
+
+return(list(graph = g, nodes = nodes_df, edges = edges_df))
+}
+
+#Network based on top 10 consensus questions
+cat("\n=== BUILDING NETWORK: TOP 10 CONSENSUS QUESTIONS ===\n")
+network_top10 <- build_direction_network(
+question_subset = top10_questions,
+data_df = df,
+threshold = 0.7,
+title = "Candidate Network: Top 10 Most Discriminating Questions (threshold=0.7)"
+)
+
+#Network statistics
+if (!is.null(network_top10)) {
+g <- network_top10$graph
+cat("\nNetwork Statistics:\n")
+cat(" Nodes:", vcount(g), "\n")
+cat(" Edges:", ecount(g), "\n")
+cat(" Density:", edge_density(g), "\n")
+cat(" Average degree:", mean(degree(g)), "\n")
+}
+
+
+
+# Session Information
+
+sessionInfo()
+
+```
+
+
+
+
+```{r}
+# This gives you everything at once
+cat("Column names:\n")
+print(names(df))
+
+cat("\nParty distribution:\n")
+print(table(df$party))
+
+cat("\nNumber of unique parties:", length(unique(df$party)), "\n")
+
+```
+
+
