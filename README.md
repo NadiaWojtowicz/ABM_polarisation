@@ -401,25 +401,11 @@ Includes:
 | Epsilon (ε) | 0.40, 0.50 |
 | Seed | 1–20 |
  
-Total simulation runs: 480.
+Total simulation runs: 480.  
 
 ---
 
-## 4. Kandidattest Questions (Selected Issues)
-
-Scaling: Original responses `[-2, -1, +1, +2]` normalized to `[-1, +1]`.
-
-- Q1 – Economy  
-- Q2 – Social  
-- Q3 – Transport  
-- Q4 – Environment  
-- Q7 – Education  
-- Q11 – Sports  
-- Q19 – Housing  
-
----
-
-## 5. Dependencies
+## 4. Dependencies
 
 ### Python
 - pandas  
